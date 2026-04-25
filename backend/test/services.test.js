@@ -5,6 +5,7 @@ import {
   normalizeModelContent,
   validateModelJson,
 } from "../src/services/guardrails.js";
+import { buildResponsePrompt } from "../src/services/promptBuilder.js";
 
 test("chunkText returns chunk metadata", async () => {
   const text = "A".repeat(1200);
@@ -17,6 +18,15 @@ test("chunkText returns chunk metadata", async () => {
 test("guardrails normalize invalid JSON", async () => {
   const normalized = normalizeModelContent("not json");
   const parsed = validateModelJson(normalized);
+  assert.equal(parsed.confidence, "low");
+});
+
+test("guardrails salvage plain text answer when JSON is missing", async () => {
+  const normalized = normalizeModelContent(`Summary of the transcript
+
+The speaker explains the main idea and then lists the practical steps.`);
+  const parsed = validateModelJson(normalized);
+  assert.match(parsed.answer, /The speaker explains/);
   assert.equal(parsed.confidence, "low");
 });
 
@@ -57,4 +67,23 @@ Extra text after JSON`);
   assert.deepEqual(parsed.sources, ["partial_0"]);
   assert.equal(parsed.confidence, "high");
   assert.ok(parsed.diagram.includes("mermaid"));
+});
+
+test("prompt builder includes transcript metadata and chunk ids", async () => {
+  const prompt = buildResponsePrompt({
+    mode: "summary",
+    query: "focus on decisions",
+    transcriptLabel: "demo.txt",
+    chunks: [
+      {
+        content: "The team decided to ship the API first and move auth cleanup to next week.",
+        metadata: { chunkIndex: 3, filename: "demo.txt" },
+      },
+    ],
+  });
+
+  assert.match(prompt, /Transcript: demo\.txt/);
+  assert.match(prompt, /User focus: focus on decisions/);
+  assert.match(prompt, /\[chunk_0\]/);
+  assert.match(prompt, /ship the API first/);
 });

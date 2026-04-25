@@ -19,6 +19,22 @@ function stripCodeFences(value) {
     .trim();
 }
 
+function coerceRawAnswer(value) {
+  const cleaned = stripCodeFences(String(value || ""))
+    .replace(/^\s*(json|output)\s*:\s*/i, "")
+    .trim();
+
+  if (!cleaned) {
+    return "";
+  }
+
+  return cleaned
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .trim();
+}
+
 function sanitizeJsonLikeString(value) {
   let result = "";
   let inString = false;
@@ -189,6 +205,29 @@ export function normalizeModelContent(content) {
       },
       "ask_debug"
     );
+  }
+
+  const rawAnswer = coerceRawAnswer(raw);
+  if (rawAnswer) {
+    if (debugAsk) {
+      logger.info(
+        {
+          event: "guardrails_raw_answer_salvaged",
+          answerLength: rawAnswer.length,
+          ...(debugAskVerbose
+            ? { answerPreview: rawAnswer.slice(0, 220) }
+            : {}),
+        },
+        "ask_debug"
+      );
+    }
+
+    return {
+      answer: rawAnswer,
+      sources: [],
+      confidence: "low",
+      diagram: "",
+    };
   }
 
   return {

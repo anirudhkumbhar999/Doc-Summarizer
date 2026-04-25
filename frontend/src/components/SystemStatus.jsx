@@ -1,10 +1,11 @@
 export default function SystemStatus({ health, error }) {
   const backendConnected = Boolean(health);
   const llmReady = Boolean(health?.llm?.ready);
+  const vectorStoreMode = health?.vectorStore?.activeMode || "unknown";
 
   return (
     <section className="card">
-      <h3>System Status</h3>
+      <h3>Status</h3>
       <div className="status-grid">
         <div className="status-row">
           <span className="status-label">Backend</span>
@@ -29,6 +30,10 @@ export default function SystemStatus({ health, error }) {
         <div className="status-row">
           <span className="status-label">Provider</span>
           <span className="status-text">{health?.llm?.provider || "groq"}</span>
+        </div>
+        <div className="status-row">
+          <span className="status-label">Vector store</span>
+          <span className="status-text">{vectorStoreMode}</span>
         </div>
       </div>
       {error ? <p className="error">{error}</p> : null}

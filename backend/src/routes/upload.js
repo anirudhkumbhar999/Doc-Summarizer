@@ -39,6 +39,7 @@ router.post("/", upload.single("transcript"), async (req, res) => {
   try {
     await fs.mkdir(uploadDir, { recursive: true });
     const docId = uuidv4();
+    const createdAtMs = Date.now();
     const transcriptName = req.file?.originalname || req.body?.transcriptName || "Pasted transcript";
 
     const text = req.file
@@ -50,7 +51,7 @@ router.post("/", upload.single("transcript"), async (req, res) => {
     }
 
     const chunks = await withTiming("chunk_text", () =>
-      chunkText(text, { docId, filename: transcriptName })
+      chunkText(text, { docId, filename: transcriptName, createdAtMs })
     );
     const nonEmptyChunks = chunks.filter((chunk) => chunk.content?.trim());
     if (!nonEmptyChunks.length) {

@@ -36,6 +36,7 @@ function looksLikeCodeTraceChunk(content) {
 }
 
 export async function chunkText(text, metadata) {
+  const createdAtMs = Number(metadata.createdAtMs || Date.now());
   const docs = await splitter.createDocuments([text], [metadata]);
   const cleaned = docs
     .map((doc, index) => ({
@@ -45,6 +46,7 @@ export async function chunkText(text, metadata) {
         docId: String(metadata.docId),
         filename: String(metadata.filename),
         chunkIndex: index,
+        createdAtMs,
       },
     }))
     .filter((chunk) => !looksLikeCodeTraceChunk(chunk.content));
@@ -56,6 +58,7 @@ export async function chunkText(text, metadata) {
       docId: String(metadata.docId),
       filename: String(metadata.filename),
       chunkIndex: index,
+      createdAtMs,
     },
   }));
 }

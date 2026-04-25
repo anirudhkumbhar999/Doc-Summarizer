@@ -7,6 +7,8 @@ import pinoHttp from "pino-http";
 import uploadRoute from "./routes/upload.js";
 import askRoute from "./routes/ask.js";
 import { logger } from "./services/logger.js";
+import { startVectorTtlCleanup } from "./services/ttlCleanup.js";
+import { getVectorStoreRuntime } from "./services/vectorStore.js";
 
 dotenv.config({
   path: path.resolve(process.cwd(), ".env"),
@@ -50,6 +52,7 @@ app.use(
 
 app.get("/health", (_req, res) => {
   const llmReady = Boolean(process.env.GROQ_API_KEY?.trim());
+  const vectorStore = getVectorStoreRuntime();
 
   res.json({
     status: "ok",
@@ -59,6 +62,7 @@ app.get("/health", (_req, res) => {
       ready: llmReady,
       status: llmReady ? "ready" : "missing_key",
     },
+    vectorStore,
   });
 });
 
@@ -71,6 +75,7 @@ app.use((err, _req, res, _next) => {
 });
 
 await fs.mkdir(uploadDir, { recursive: true });
+startVectorTtlCleanup();
 app.listen(port, () => {
   logger.info({ port }, "backend_started");
 });

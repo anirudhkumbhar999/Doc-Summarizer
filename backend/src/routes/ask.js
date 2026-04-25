@@ -1,140 +1,86 @@
 import express from "express";
 import { ChatGroq } from "@langchain/groq";
 import { retrieveTopK } from "../services/retriever.js";
-import { buildBatchSynthesisPrompt, buildRagPrompt } from "../services/promptBuilder.js";
+import { buildRepairPrompt, buildResponsePrompt } from "../services/promptBuilder.js";
 import { fallbackResponse } from "../services/fallback.js";
 import { normalizeModelContent, validateModelJson } from "../services/guardrails.js";
 import { getChunksByDocId } from "../services/vectorStore.js";
 import { logger, withTiming } from "../services/logger.js";
 
 const router = express.Router();
-const llm = new ChatGroq({
-  model: process.env.CHAT_MODEL || "llama-3.1-8b-instant",
-  temperature: Number(process.env.TEMPERATURE || 0.2),
-  apiKey: process.env.GROQ_API_KEY,
-});
-const minAnswerChars = Number(process.env.MIN_ANSWER_CHARS || 280);
-const minAnswerParagraphs = Number(process.env.MIN_ANSWER_PARAGRAPHS || 2);
-const allowedModes = new Set(["summary", "notes", "question"]);
-const summaryBatchSize = Number(process.env.SUMMARY_BATCH_SIZE || 12);
-const summaryMaxChunks = Number(process.env.SUMMARY_MAX_CHUNKS || 48);
-const summaryBatchConcurrency = Number(process.env.SUMMARY_BATCH_CONCURRENCY || 3);
-const questionTopK = Number(process.env.QUESTION_TOP_K || 8);
 const hasRemoteModel = Boolean(process.env.GROQ_API_KEY?.trim());
 const groqJsonMode = process.env.GROQ_JSON_MODE !== "0";
 const debugAsk = process.env.DEBUG_ASK === "1";
 const debugAskVerbose = process.env.DEBUG_ASK_VERBOSE === "1";
+const llm = hasRemoteModel
+  ? new ChatGroq({
+      model: process.env.CHAT_MODEL || "llama-3.1-8b-instant",
+      temperature: Number(process.env.TEMPERATURE || 0.2),
+      apiKey: process.env.GROQ_API_KEY,
+    })
+  : null;
 
-function previewText(value, maxLength = 300) {
+const allowedModes = new Set(["summary", "notes", "question"]);
+const baseMinAnswerChars = Number(process.env.MIN_ANSWER_CHARS || 280);
+const questionTopK = Number(process.env.QUESTION_TOP_K || 8);
+const summaryContextLimit = Math.max(
+  8,
+  Math.min(Number(process.env.SUMMARY_MAX_CHUNKS || 14), 18)
+);
+const notesContextLimit = Math.max(
+  10,
+  Math.min(Number(process.env.SUMMARY_MAX_CHUNKS || 16), 20)
+);
+
+function previewText(value, maxLength = 220) {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
-async function generateStructuredAnswer(prompt, context = {}) {
-  const modelResult = await withTiming("llm_generate", () =>
-    llm.invoke(
-      prompt,
-      groqJsonMode ? { response_format: { type: "json_object" } } : undefined
-    )
+function getRawModelContent(content) {
+  return typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content
+          .map((part) =>
+            typeof part === "string" ? part : (part?.text ?? part?.content ?? "")
+          )
+          .join("\n")
+      : String(content ?? "");
+}
+
+function isCanonicalFailure(answer) {
+  return (
+    answer === "I couldn't build a grounded response from the current transcript context." ||
+    answer === "I don't have enough information to answer this question."
   );
-  const rawContent =
-    typeof modelResult.content === "string"
-      ? modelResult.content
-      : Array.isArray(modelResult.content)
-        ? modelResult.content
-            .map((part) =>
-              typeof part === "string" ? part : (part?.text ?? part?.content ?? "")
-            )
-            .join("\n")
-        : String(modelResult.content ?? "");
-
-  if (debugAsk) {
-    const rawMeta = {
-      rawLength: rawContent.length,
-      hasJsonFence: /```json/i.test(rawContent),
-      hasCodeFence: /```/.test(rawContent),
-      hasMermaid: /```mermaid/i.test(rawContent),
-    };
-    logger.info(
-      {
-        event: "llm_raw_output",
-        context,
-        jsonMode: groqJsonMode,
-        ...rawMeta,
-        ...(debugAskVerbose ? { rawPreview: previewText(rawContent, 220) } : {}),
-      },
-      "ask_debug"
-    );
-  }
-
-  const parsed = normalizeModelContent(modelResult.content);
-  const validated = validateModelJson(parsed);
-
-  if (debugAsk) {
-    logger.info(
-      {
-        event: "llm_parsed_output",
-        context,
-        parsedKeys: Object.keys(parsed || {}),
-        answerLength: validated.answer.length,
-        sourceCount: Array.isArray(validated.sources) ? validated.sources.length : 0,
-        confidence: validated.confidence,
-        ...(debugAskVerbose
-          ? { answerPreview: previewText(validated.answer, 220) }
-          : {}),
-      },
-      "ask_debug"
-    );
-  }
-
-  return validated;
 }
 
 function paragraphCount(answer) {
-  return answer
+  return String(answer || "")
     .split(/\n\s*\n/g)
     .map((part) => part.trim())
     .filter(Boolean).length;
 }
 
-function queryForMode(mode, query) {
-  if (mode === "question") {
-    return query;
-  }
-
-  if (mode === "notes") {
-    return "transcript notes key points action items topics";
-  }
-
-  return "transcript summary key decisions outcomes";
-}
-
-function chunkArray(items, size) {
-  const batches = [];
-  for (let index = 0; index < items.length; index += size) {
-    batches.push(items.slice(index, index + size));
-  }
-  return batches;
-}
-
 function minCharsForMode(mode) {
-  if (mode === "summary") return Math.max(minAnswerChars, 420);
-  if (mode === "notes") return Math.max(minAnswerChars, 360);
-  return minAnswerChars;
+  if (mode === "summary") return Math.max(baseMinAnswerChars, 420);
+  if (mode === "notes") return Math.max(baseMinAnswerChars, 360);
+  return Math.max(baseMinAnswerChars, 220);
 }
 
-function pickSummaryChunks(chunks, maxChunks) {
-  if (chunks.length <= maxChunks) {
+function sampleDistributedChunks(chunks, count) {
+  if (chunks.length <= count) {
     return chunks;
   }
 
   const picks = [];
   const usedIndexes = new Set();
 
-  for (let slot = 0; slot < maxChunks; slot += 1) {
+  for (let slot = 0; slot < count; slot += 1) {
     const index = Math.min(
       chunks.length - 1,
-      Math.floor((slot * chunks.length) / maxChunks)
+      Math.floor((slot * chunks.length) / count)
     );
 
     if (!usedIndexes.has(index)) {
@@ -149,25 +95,19 @@ function pickSummaryChunks(chunks, maxChunks) {
   );
 }
 
-async function mapWithConcurrency(items, limit, mapper) {
-  const results = new Array(items.length);
-  let nextIndex = 0;
-
-  async function worker() {
-    while (nextIndex < items.length) {
-      const currentIndex = nextIndex;
-      nextIndex += 1;
-      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+function mergeUniqueChunks(chunks) {
+  const seen = new Set();
+  return chunks.filter((chunk) => {
+    if (!chunk?.id || seen.has(chunk.id)) {
+      return false;
     }
-  }
-
-  const workerCount = Math.max(1, Math.min(limit, items.length));
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
-  return results;
+    seen.add(chunk.id);
+    return true;
+  });
 }
 
-function normalizeSourcesFromContext(sources, answer, retrieved) {
-  const allowed = new Set(retrieved.map((_, index) => `chunk_${index}`));
+function normalizeSourcesFromContext(sources, answer, contextChunks) {
+  const allowed = new Set(contextChunks.map((_, index) => `chunk_${index}`));
   const normalized = (Array.isArray(sources) ? sources : []).filter((source) =>
     allowed.has(source)
   );
@@ -176,7 +116,7 @@ function normalizeSourcesFromContext(sources, answer, retrieved) {
     return [...new Set(normalized)];
   }
 
-  const matchedInAnswer = [...answer.matchAll(/chunk_(\d+)/g)]
+  const matchedInAnswer = [...String(answer || "").matchAll(/chunk_(\d+)/g)]
     .map((match) => `chunk_${match[1]}`)
     .filter((source) => allowed.has(source));
 
@@ -184,126 +124,239 @@ function normalizeSourcesFromContext(sources, answer, retrieved) {
     return [...new Set(matchedInAnswer)];
   }
 
-  return retrieved.slice(0, 3).map((_chunk, index) => `chunk_${index}`);
+  return contextChunks.slice(0, Math.min(3, contextChunks.length)).map((_, index) => `chunk_${index}`);
 }
 
-function refineInstruction(mode, minChars, minParagraphs) {
-  return `Important: rewrite your previous output and improve quality.
-- Keep strict JSON.
-- Answer length must be at least ${minChars} characters.
-- Use at least ${minParagraphs} paragraphs with explicit blank lines ("\\n\\n").
-- Follow the required ${mode} section structure.
-- Make it clear and chat-style, not terse.`;
-}
+async function chooseContextChunks({ mode, query, docId }) {
+  const allChunks = await withTiming("load_transcript_chunks", () => getChunksByDocId(docId));
+  if (!allChunks.length) {
+    return {
+      allChunks: [],
+      selectedChunks: [],
+      selectionStrategy: "empty",
+    };
+  }
 
-function isCanonicalFailure(answer) {
-  return (
-    answer === "I couldn't build a grounded response from the current transcript context." ||
-    answer === "I don't have enough information to answer this question."
+  if (mode === "question") {
+    const selectedChunks = await withTiming("retrieve_context", () =>
+      retrieveTopK(query, questionTopK, docId)
+    );
+
+    return {
+      allChunks,
+      selectedChunks,
+      selectionStrategy: "retrieval",
+    };
+  }
+
+  const baseLimit = mode === "notes" ? notesContextLimit : summaryContextLimit;
+  const distributed = sampleDistributedChunks(allChunks, baseLimit);
+
+  if (!query.trim()) {
+    return {
+      allChunks,
+      selectedChunks: distributed,
+      selectionStrategy: "distributed",
+    };
+  }
+
+  const focused = await withTiming("retrieve_focus_context", () =>
+    retrieveTopK(`${mode} ${query}`, Math.min(questionTopK, 6), docId)
   );
+
+  return {
+    allChunks,
+    selectedChunks: mergeUniqueChunks([...focused, ...distributed]).slice(0, baseLimit + 4),
+    selectionStrategy: "focused+distributed",
+  };
 }
 
-function isFallbackPayload(payload) {
-  return Boolean(payload?.fallbackReason);
-}
+async function invokeModel(prompt, { jsonMode, context }) {
+  const modelResult = await withTiming(
+    jsonMode ? "llm_generate_json" : "llm_generate_plain",
+    () =>
+      llm.invoke(
+        prompt,
+        jsonMode ? { response_format: { type: "json_object" } } : undefined
+      )
+  );
 
-async function generateLongFormFromChunks({ mode, query, chunks }) {
-  if (!hasRemoteModel) {
-    return fallbackResponse("llm_unavailable");
+  const rawContent = getRawModelContent(modelResult.content);
+  const normalized = normalizeModelContent(rawContent);
+  const payload = validateModelJson(normalized);
+
+  if (debugAsk) {
+    logger.info(
+      {
+        event: "llm_attempt_complete",
+        attempt: jsonMode ? "json_mode" : "plain_mode",
+        context,
+        rawLength: rawContent.length,
+        answerLength: payload.answer.length,
+        confidence: payload.confidence,
+        ...(debugAskVerbose
+          ? {
+              rawPreview: previewText(rawContent),
+              answerPreview: previewText(payload.answer),
+            }
+          : {}),
+      },
+      "ask_debug"
+    );
   }
 
-  const selectedChunks = pickSummaryChunks(chunks, summaryMaxChunks);
-  const batches = chunkArray(selectedChunks, summaryBatchSize);
-  const partials = (
-    await mapWithConcurrency(batches, summaryBatchConcurrency, async (batch) => {
-      try {
-        const partial = await generateStructuredAnswer(
-          buildRagPrompt({ mode, query, chunks: batch }),
-          {
-            stage: "long_form_batch",
-            mode,
-            batchChunkCount: batch.length,
-            totalChunkCount: chunks.length,
-          }
-        );
-        return isCanonicalFailure(partial.answer) ? null : partial;
-      } catch (error) {
-        if (debugAsk) {
-          logger.warn(
-            {
-              event: "long_form_batch_failed",
-              mode,
-              batchChunkCount: batch.length,
-              error: error.message,
-            },
-            "ask_debug"
-          );
-        }
-        return null;
+  return { rawContent, payload };
+}
+
+async function generateStructuredResponse({
+  mode,
+  query,
+  transcriptLabel,
+  chunks,
+  extraInstruction = "",
+}) {
+  const prompt = buildResponsePrompt({
+    mode,
+    query,
+    transcriptLabel,
+    chunks,
+    extraInstruction,
+  });
+
+  let lastRawContent = "";
+
+  if (groqJsonMode) {
+    try {
+      const result = await invokeModel(prompt, {
+        jsonMode: true,
+        context: { mode, stage: "primary", chunkCount: chunks.length },
+      });
+      lastRawContent = result.rawContent;
+      if (!isCanonicalFailure(result.payload.answer)) {
+        return result.payload;
       }
-    })
-  ).filter(Boolean);
-
-  if (!partials.length) {
-    return fallbackResponse("llm_or_retrieval_failure");
-  }
-
-  if (partials.length === 1) {
-    return partials[0];
-  }
-
-  return generateStructuredAnswer(
-    buildBatchSynthesisPrompt({
-      mode,
-      query,
-      partialAnswers: partials.map((item) => item.answer),
-    }),
-    {
-      stage: "long_form_synthesis",
-      mode,
-      partialCount: partials.length,
-      totalChunkCount: chunks.length,
+    } catch (error) {
+      if (debugAsk) {
+        logger.warn(
+          { event: "llm_json_mode_failed", mode, error: error.message },
+          "ask_debug"
+        );
+      }
     }
-  ).catch(() => fallbackResponse("llm_or_retrieval_failure"));
+  }
+
+  try {
+    const result = await invokeModel(prompt, {
+      jsonMode: false,
+      context: { mode, stage: "plain_retry", chunkCount: chunks.length },
+    });
+    lastRawContent = result.rawContent;
+    if (!isCanonicalFailure(result.payload.answer)) {
+      return result.payload;
+    }
+  } catch (error) {
+    if (debugAsk) {
+      logger.warn(
+        { event: "llm_plain_mode_failed", mode, error: error.message },
+        "ask_debug"
+      );
+    }
+  }
+
+  if (lastRawContent.trim()) {
+    try {
+      const repair = await invokeModel(buildRepairPrompt(lastRawContent), {
+        jsonMode: groqJsonMode,
+        context: { mode, stage: "repair" },
+      });
+      if (!isCanonicalFailure(repair.payload.answer)) {
+        return repair.payload;
+      }
+    } catch (error) {
+      if (debugAsk) {
+        logger.warn(
+          { event: "llm_repair_failed", mode, error: error.message },
+          "ask_debug"
+        );
+      }
+    }
+
+    return validateModelJson(normalizeModelContent(lastRawContent));
+  }
+
+  return fallbackResponse("llm_or_retrieval_failure");
 }
 
-async function refineLongFormAnswer({ mode, query, answer }) {
-  return generateStructuredAnswer(
-    `${buildBatchSynthesisPrompt({
+async function maybeExpandAnswer({ mode, query, transcriptLabel, chunks, payload }) {
+  const answer = String(payload?.answer || "").trim();
+  if (!answer || payload?.fallbackReason || isCanonicalFailure(answer)) {
+    return payload;
+  }
+
+  const targetMinChars = minCharsForMode(mode);
+  const tooShort = answer.length < targetMinChars;
+  const tooFlat = paragraphCount(answer) < (mode === "question" ? 2 : 3);
+
+  if (!tooShort && !tooFlat) {
+    return payload;
+  }
+
+  try {
+    const expanded = await generateStructuredResponse({
       mode,
       query,
-      partialAnswers: [answer],
-    })}\n\n${refineInstruction(mode, minCharsForMode(mode), minAnswerParagraphs)}`,
-    {
-      stage: "long_form_refine",
-      mode,
-      answerLength: answer.length,
+      transcriptLabel,
+      chunks,
+      extraInstruction: [
+        `Your previous draft was too short or too flat.`,
+        `Expand it into a stronger ${mode} response.`,
+        `Keep it grounded in the transcript context only.`,
+        `Previous draft: ${answer}`,
+      ].join("\n"),
+    });
+
+    if (expanded.answer.length > answer.length && !isCanonicalFailure(expanded.answer)) {
+      return expanded;
     }
-  ).catch(() => null);
+  } catch (error) {
+    if (debugAsk) {
+      logger.warn(
+        { event: "llm_expand_failed", mode, error: error.message },
+        "ask_debug"
+      );
+    }
+  }
+
+  return payload;
 }
 
 router.post("/", async (req, res) => {
   const { query = "", mode = "question", docId = "" } = req.body || {};
+
   if (!allowedModes.has(mode)) {
     return res.status(400).json({ error: "mode must be one of: summary, notes, question" });
   }
 
-  if (!docId.trim()) {
+  if (!String(docId || "").trim()) {
     return res.status(400).json({
       ...fallbackResponse("missing_transcript"),
       mode,
     });
   }
 
-  if (mode === "question" && !query.trim()) {
+  if (mode === "question" && !String(query || "").trim()) {
     return res.status(400).json({ error: "query is required when mode=question" });
   }
 
-  try {
-    let retrieved = [];
-    let totalChunks = 0;
-    let safe;
+  if (!hasRemoteModel) {
+    return res.status(200).json({
+      ...fallbackResponse("llm_unavailable"),
+      mode,
+      diagnostics: { docId },
+    });
+  }
 
+  try {
     if (debugAsk) {
       logger.info(
         {
@@ -316,122 +369,78 @@ router.post("/", async (req, res) => {
       );
     }
 
-    if (!hasRemoteModel) {
+    const { allChunks, selectedChunks, selectionStrategy } = await chooseContextChunks({
+      mode,
+      query: String(query || ""),
+      docId: String(docId || ""),
+    });
+
+    if (!allChunks.length) {
       return res.status(200).json({
-        ...fallbackResponse("llm_unavailable"),
-        mode,
-        diagnostics: { docId },
-      });
-    }
-
-    if (mode === "question") {
-      const retrievalQuery = queryForMode(mode, query);
-      retrieved = await withTiming("retrieve_context", () =>
-        retrieveTopK(retrievalQuery, questionTopK, docId)
-      );
-      if (!retrieved.length) {
-        return res.json({
-          ...fallbackResponse("no_relevant_context"),
-          mode,
-          diagnostics: { topK: 0, results: [], docId },
-        });
-      }
-
-      const prompt = buildRagPrompt({ mode, query, chunks: retrieved });
-      try {
-        safe = await generateStructuredAnswer(prompt, {
-          stage: "question",
-          mode,
-          retrievedCount: retrieved.length,
-        });
-      } catch (error) {
-        if (debugAsk) {
-          logger.warn(
-            { event: "question_generation_failed", mode, error: error.message },
-            "ask_debug"
-          );
-        }
-        safe = fallbackResponse("llm_or_retrieval_failure");
-      }
-    } else {
-      retrieved = await withTiming("load_transcript_chunks", () => getChunksByDocId(docId));
-      totalChunks = retrieved.length;
-      if (!retrieved.length) {
-        return res.json({
-          ...fallbackResponse("no_relevant_context"),
-          mode,
-          diagnostics: { topK: 0, results: [], docId },
-        });
-      }
-
-      safe = await withTiming("long_form_generation", () =>
-        generateLongFormFromChunks({ mode, query, chunks: retrieved })
-      );
-    }
-
-    if (!retrieved.length) {
-      return res.json({
         ...fallbackResponse("no_relevant_context"),
         mode,
-        diagnostics: { topK: 0, results: [], docId },
+        diagnostics: {
+          docId,
+          chunkCount: 0,
+          totalChunkCount: 0,
+          selectionStrategy,
+        },
       });
     }
 
-    const targetMinChars = minCharsForMode(mode);
-    const isFallback = isFallbackPayload(safe);
-    const shortAnswer =
-      safe.answer.length < targetMinChars &&
-      !isCanonicalFailure(safe.answer) &&
-      !isFallback;
-    const tooFewParagraphs =
-      paragraphCount(safe.answer) < minAnswerParagraphs &&
-      !isCanonicalFailure(safe.answer) &&
-      !isFallback;
-
-    if (shortAnswer || tooFewParagraphs) {
-      if (mode === "question") {
-        try {
-          safe = await generateStructuredAnswer(
-            `${buildRagPrompt({ mode, query, chunks: retrieved })}\n\n${refineInstruction(
-              mode,
-              targetMinChars,
-              minAnswerParagraphs
-            )}`,
-            {
-              stage: "question_refine",
-              mode,
-              retrievedCount: retrieved.length,
-              priorAnswerLength: safe.answer.length,
-            }
-          );
-        } catch (error) {
-          if (debugAsk) {
-            logger.warn(
-              { event: "question_refine_failed", mode, error: error.message },
-              "ask_debug"
-            );
-          }
-          safe = fallbackResponse("llm_or_retrieval_failure");
-        }
-      } else {
-        const refined = await refineLongFormAnswer({
-          mode,
-          query,
-          answer: safe.answer,
-        });
-        if (refined && !isCanonicalFailure(refined.answer)) {
-          safe = refined;
-        }
-      }
+    if (!selectedChunks.length) {
+      return res.status(200).json({
+        ...fallbackResponse("no_relevant_context"),
+        mode,
+        diagnostics: {
+          docId,
+          chunkCount: 0,
+          totalChunkCount: allChunks.length,
+          selectionStrategy,
+        },
+      });
     }
 
+    const transcriptLabel =
+      String(selectedChunks[0]?.metadata?.filename || allChunks[0]?.metadata?.filename || "Transcript");
+
+    let payload = await generateStructuredResponse({
+      mode,
+      query: String(query || ""),
+      transcriptLabel,
+      chunks: selectedChunks,
+    });
+
+    payload = await maybeExpandAnswer({
+      mode,
+      query: String(query || ""),
+      transcriptLabel,
+      chunks: selectedChunks,
+      payload,
+    });
+
     const keepSourcesEmpty =
-      isFallbackPayload(safe) || isCanonicalFailure(safe.answer);
-    const safeWithNormalizedSources = {
-      ...safe,
+      Boolean(payload.fallbackReason) || isCanonicalFailure(payload.answer);
+
+    const response = {
+      ...payload,
+      mode,
       sources: keepSourcesEmpty
         ? []
-        : normalizeSourcesFromContext(safe.sources, safe.answer, retrieved),
+        : normalizeSourcesFromContext(payload.sources, payload.answer, selectedChunks),
+      diagnostics: {
+        docId,
+        transcriptName: transcriptLabel,
+        chunkCount: selectedChunks.length,
+        totalChunkCount: allChunks.length,
+        selectionStrategy,
+        results: selectedChunks.slice(0, 20).map((chunk) => ({
+          id: chunk.id,
+          docId: chunk.metadata?.docId,
+          chunkIndex: chunk.metadata?.chunkIndex,
+          filename: chunk.metadata?.filename,
+        })),
+      },
     };
 
     if (debugAsk) {
@@ -439,40 +448,19 @@ router.post("/", async (req, res) => {
         {
           event: "ask_response_ready",
           mode,
-          isFallback,
-          fallbackReason: safeWithNormalizedSources.fallbackReason,
-          answerLength: safeWithNormalizedSources.answer.length,
-          sourceCount: safeWithNormalizedSources.sources.length,
-          chunkCount: retrieved.length,
-          totalChunkCount: totalChunks || undefined,
-          shortAnswer,
-          tooFewParagraphs,
-          ...(debugAskVerbose
-            ? { answerPreview: previewText(safeWithNormalizedSources.answer, 220) }
-            : {}),
+          chunkCount: response.diagnostics.chunkCount,
+          totalChunkCount: response.diagnostics.totalChunkCount,
+          fallbackReason: response.fallbackReason,
+          answerLength: response.answer.length,
+          sourceCount: response.sources.length,
+          selectionStrategy,
+          ...(debugAskVerbose ? { answerPreview: previewText(response.answer) } : {}),
         },
         "ask_debug"
       );
     }
 
-    return res.json({
-      ...safeWithNormalizedSources,
-      mode,
-      diagnostics: {
-        topK: mode === "question" ? retrieved.length : undefined,
-        chunkCount: retrieved.length,
-        totalChunkCount: mode === "question" ? undefined : totalChunks,
-        processedChunkCount:
-          mode === "question" ? undefined : Math.min(retrieved.length, summaryMaxChunks),
-        docId,
-        results: retrieved.slice(0, 20).map((chunk) => ({
-          id: chunk.id,
-          distance: chunk.distance,
-          docId: chunk.metadata?.docId,
-          chunkIndex: chunk.metadata?.chunkIndex,
-        })),
-      },
-    });
+    return res.status(200).json(response);
   } catch (error) {
     logger.error(
       {
@@ -483,10 +471,14 @@ router.post("/", async (req, res) => {
       },
       "ask_debug"
     );
+
     return res.status(200).json({
       ...fallbackResponse("llm_or_retrieval_failure"),
       mode,
       error: error.message,
+      diagnostics: {
+        docId,
+      },
     });
   }
 });

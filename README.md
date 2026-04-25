@@ -42,8 +42,11 @@ Use root `.env` (no leading spaces before keys).
 ```env
 GROQ_API_KEY=your_groq_key
 CHROMA_URL=http://localhost:8000
+VECTOR_STORE_MODE=auto
 PORT=4100
 GROQ_JSON_MODE=1
+VECTOR_TTL_MINUTES=60
+VECTOR_CLEANUP_INTERVAL_MINUTES=5
 DEBUG_ASK=0
 DEBUG_ASK_VERBOSE=0
 LOG_HTTP_ACCESS=0
@@ -56,6 +59,7 @@ Other useful tuning vars:
 - `QUESTION_TOP_K`
 - `MIN_ANSWER_CHARS`
 - `MIN_ANSWER_PARAGRAPHS`
+- `VECTOR_STORE_MODE` (`auto` | `chroma` | `memory`)
 
 ## API Contract
 - `GET /health`
@@ -72,6 +76,7 @@ Other useful tuning vars:
 - Guardrails attempt to recover JSON from common malformed model responses.
 - On unrecoverable generation/parse failure, backend returns fallback response with low confidence.
 - Fallback responses now keep `sources: []` (no synthetic chunk sources).
+- Vector data is temporary by TTL: expired transcript vectors are auto-deleted by background cleanup.
 
 ## Debugging
 Minimal high-signal debug:

@@ -139,46 +139,63 @@ export default function App() {
 
   return (
     <main className="app-shell">
-      <aside className="sidebar">
-        <div className="sidebar-panel brand-panel">
-          <p className="eyebrow">RAG Workspace</p>
-          <h1>Transcript Summarizer</h1>
-          <p className="muted-text">
-            Upload one transcript, then generate polished summaries, notes, and grounded answers.
-          </p>
-        </div>
-        <SystemStatus health={health} error={error} />
-        <UploadPanel
-          onUpload={handleUpload}
-          loading={uploading}
-          activeTranscript={activeTranscript}
-        />
-        <AskPanel
-          onAsk={handleAsk}
-          loading={asking}
-          disabled={!activeTranscript || uploading}
-        />
-      </aside>
-
-      <section className="chat-stage">
-        <div className="chat-stage-header">
-          <div>
-            <p className="eyebrow">Conversation</p>
-            <h2>Transcript Chat</h2>
+      <section className="workspace-grid">
+        <aside className="sidebar">
+          <div className="sidebar-panel brand-panel">
+            <p className="eyebrow">Workspace</p>
+            <h2>Transcript Summarizer</h2>
+            <p className="muted-text">
+              Upload one transcript, then generate polished summaries, notes, and grounded
+              answers.
+            </p>
           </div>
-          {activeTranscript ? (
-            <div className="active-pill">{activeTranscript.transcriptName}</div>
-          ) : (
-            <div className="active-pill inactive">No transcript loaded</div>
-          )}
-        </div>
+          <SystemStatus health={health} error={error} />
+          <UploadPanel
+            onUpload={handleUpload}
+            loading={uploading}
+            activeTranscript={activeTranscript}
+          />
+          <AskPanel
+            onAsk={handleAsk}
+            loading={asking}
+            disabled={!activeTranscript || uploading}
+          />
+        </aside>
 
-        <ResultView
-          messages={messages}
-          loading={asking}
-          hasTranscript={Boolean(activeTranscript)}
-          activeTranscript={activeTranscript}
-        />
+        <section className="chat-stage">
+          <header className="app-hero stage-hero">
+            <div className="hero-copy">
+              <p className="eyebrow">Transcript Workspace</p>
+              <h1>Clean, grounded summaries from any transcript.</h1>
+              <p className="hero-text">
+                Upload a transcript once, then ask for a summary, notes, or a question answer with
+                a calm, minimal interface.
+              </p>
+            </div>
+            <div className="hero-chip">
+              {activeTranscript ? activeTranscript.transcriptName : "No transcript loaded"}
+            </div>
+          </header>
+
+          <div className="chat-stage-header">
+            <div>
+              <p className="eyebrow">Conversation</p>
+              <h2>Transcript Chat</h2>
+            </div>
+            {activeTranscript ? (
+              <div className="active-pill">{activeTranscript.transcriptName}</div>
+            ) : (
+              <div className="active-pill inactive">No transcript loaded</div>
+            )}
+          </div>
+
+          <ResultView
+            messages={messages}
+            loading={asking}
+            hasTranscript={Boolean(activeTranscript)}
+            activeTranscript={activeTranscript}
+          />
+        </section>
       </section>
     </main>
   );

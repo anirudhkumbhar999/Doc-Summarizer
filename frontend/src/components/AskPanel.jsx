@@ -17,8 +17,8 @@ export default function AskPanel({ onAsk, loading, disabled }) {
 
   return (
     <form onSubmit={submit} className="card">
-      <h3>Generate Summary / Notes / Answers</h3>
-      <label htmlFor="mode">Output Type</label>
+      <h3>Ask</h3>
+      <label htmlFor="mode">Mode</label>
       <select
         id="mode"
         value={safeMode}
@@ -28,15 +28,15 @@ export default function AskPanel({ onAsk, loading, disabled }) {
       >
         <option value="summary">Summary</option>
         <option value="notes">Notes</option>
-        <option value="question">Question Answering</option>
+        <option value="question">Question</option>
       </select>
       <textarea
         value={safeQuery}
         rows={4}
         placeholder={
           safeMode === "question"
-            ? "Ask your question from transcript context..."
-            : "Optional focus (e.g., sprint planning, blockers, key decisions)..."
+            ? "Ask a question from the transcript..."
+            : "Optional focus, like decisions, blockers, or topics..."
         }
         disabled={disabled}
         onChange={(event) => setQuery(event.target.value)}
